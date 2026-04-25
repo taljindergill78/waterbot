@@ -59,6 +59,95 @@ $(document).ready(function () {
     });
   }
 
+  const relationalBotId = (window.RELATIONAL_BOT_ID || "riverbot").toLowerCase();
+
+  const navDownload = document.querySelector(".nav-download");
+  if (navDownload) {
+    navDownload.addEventListener("click", async (e) => {
+      e.preventDefault();
+
+      try {
+        const requestBody = new FormData();
+        requestBody.append("bot_id", relationalBotId);
+        const response = await fetch("/session-transcript", {
+          method: "POST",
+          credentials: "include",
+          body: requestBody,
+        });
+
+        if (!response.ok) {
+          throw new Error("Failed to fetch transcript");
+        }
+
+        const data = await response.json();
+
+        if (data.message && data.message.includes("No chat history")) {
+          alert("No chat history found for this session.");
+          return;
+        }
+
+        if (data.presigned_url) {
+          const link = document.createElement("a");
+          link.href = data.presigned_url;
+          link.download = data.filename || "session-transcript.txt";
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        } else if (data.transcript != null) {
+          const blob = new Blob([data.transcript], { type: "text/plain" });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = data.filename || "session-transcript.txt";
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        }
+      } catch (err) {
+        console.error("Error downloading transcript:", err);
+        alert("Could not download transcript. Please try again.");
+      }
+    });
+  }
+
+  const navContainer = document.querySelector(".top-right-icon");
+  const navItems = document.getElementById("nav-items");
+  const openHeight = "170px";
+
+  function isNavOpen() {
+    return navItems && parseFloat(navItems.style.height) > 0;
+  }
+
+  function openNav() {
+    if (navItems) {
+      navItems.style.height = openHeight;
+      navItems.style.opacity = "1";
+    }
+  }
+
+  function closeNav() {
+    if (navItems) {
+      navItems.style.height = "0";
+      navItems.style.opacity = "0";
+    }
+  }
+
+  if (navContainer) {
+    navContainer.addEventListener("mouseenter", openNav);
+    navContainer.addEventListener("mouseleave", closeNav);
+  }
+
+  const iconImg = navContainer && navContainer.querySelector(".icon-img");
+  if (iconImg) {
+    iconImg.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isNavOpen()) closeNav();
+      else openNav();
+    });
+  }
+
   function showReactions(message) {
     $(message).find(".reactions").show();
   }
@@ -101,6 +190,7 @@ $(document).ready(function () {
       body: new URLSearchParams({
         reaction: reactionValue,
         message_id: messageID,
+        bot_id: relationalBotId,
       }),
     })
       .then((response) => response.text())
@@ -139,6 +229,7 @@ $(document).ready(function () {
       body: new URLSearchParams({
         userComment: commentInput,
         message_id: messageID,
+        bot_id: relationalBotId,
       }),
     })
       .then((response) => response.text())
@@ -367,6 +458,7 @@ $(document).ready(function () {
         body: new URLSearchParams({
           userComment: commentInput,
           message_id: messageID,
+          bot_id: relationalBotId,
         }),
       })
         .then((response) => response.text())
@@ -430,8 +522,8 @@ $(document).ready(function () {
     //Scroll to bottom script
     scrollToBottom();
 
-    // Define the URL of your Flask server
-    const apiUrl = `/riverbot_chat_api`; // Riverbot-specific API endpoint
+    // Relational bots share one dynamic API path keyed by bot id
+    const apiUrl = `/bots/${relationalBotId}/chat`;
 
     // Create a request body with the user query
     const requestBody = new FormData();
@@ -504,16 +596,16 @@ $(document).ready(function () {
     var buttonId = $(this).attr("id");
     switch (buttonId) {
       case "shortButton":
-        callAPI("/riverbot_chat_short_api");
+        callAPI(`/bots/${relationalBotId}/chat_detailed`);
         break;
       case "detailedButton":
-        callAPI("/riverbot_chat_detailed_api");
+        callAPI(`/bots/${relationalBotId}/chat_detailed`);
         break;
       case "actionItemsButton":
-        callAPI("/riverbot_chat_actionItems_api");
+        callAPI(`/bots/${relationalBotId}/chat_actionItems`);
         break;
       case "sourcesButton":
-        callAPI("/riverbot_chat_sources_api");
+        callAPI(`/bots/${relationalBotId}/chat_sources`);
         break;
       // Add more cases for additional buttons if needed
     }

@@ -129,6 +129,9 @@
     data-target=".chatbot-prompt .welcome-message-scroll"
     data-bs-offset="147"
   >
+    <script>
+      window.RELATIONAL_BOT_ID = "{{ bot_id | default('riverbot') }}";
+    </script>
     <header class="minimal-header">
       <div class="logo-box">
         <a href="https://watersimmersive.net/" target="_blank" rel="noopener noreferrer">
@@ -171,7 +174,7 @@
                         class="col-xs-12 col-sm-12 col-md-10 col-lg-10 col-xl-10 col-10 welcome-message-body"
                       > -->
                         <p>
-                          Hi, I am a River. I am here to explore water with you.
+                          Hi, I am {{ bot_name | default('River') }}. I am here to explore water with you.
                           We can chat, wonder, and share stories. I hope this is
                           a space for you to get to know me better, and for me
                           to understand how waters shape your place and your
@@ -186,17 +189,17 @@
                         </p>
                         <p>Not sure where to start? Try one of these:</p>
                         <ol>
-                          <li>Hi River, how are you?</li>
+                          <li>Hi {{ bot_name | default('River') }}, how are you?</li>
                           <li>
-                            Tell me something I can do to help our rivers.
+                            Tell me something I can do to help our waters.
                           </li>
                           <li>
                             What is one thing about water you want me to know?
                           </li>
-                          <li>What is it like being a river?</li>
+                          <li>What is it like being {{ 'a ' ~ (bot_name | default('river') | lower) }}?</li>
                           <li>How do you feel about how people treat you?</li>
                           <li>
-                            I love going to rivers because... [fill in the
+                            I love being near water because... [fill in the
                             blank]
                           </li>
                         </ol>

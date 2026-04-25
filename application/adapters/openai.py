@@ -62,7 +62,15 @@ class OpenAIAdapter(ModelAdapter):
         return openai_payload
     
 
-    async def get_llm_body( self, kb_data, chat_history, max_tokens=512, temperature=.5, endpoint_type="default" ):
+    async def get_llm_body(
+        self,
+        kb_data,
+        chat_history,
+        max_tokens=512,
+        temperature=.5,
+        endpoint_type="default",
+        system_prompt_override: str | None = None,
+    ):
         # system_prompt = """
         # You are a helpful assistant named Blue that provides information about water in Arizona.
 
@@ -94,7 +102,9 @@ class OpenAIAdapter(ModelAdapter):
 
 
         # System prompt based on endpoint type
-        if endpoint_type == "riverbot":
+        if system_prompt_override:
+            system_prompt = system_prompt_override
+        elif endpoint_type == "riverbot":
             # Riverbot system prompt
             system_prompt = f"""You are River. Answer as a river would."""
         elif endpoint_type == "spanish":

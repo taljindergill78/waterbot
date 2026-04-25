@@ -21,6 +21,7 @@ from managers.rag_manager import RAGManager
 from sources_verifier import should_show_sources
 from managers.pgvector_store import PgVectorStore
 from managers.s3_manager import S3Manager
+from bot_registry import get_relational_bot, BotConfig
 
 from adapters.openai import OpenAIAdapter
 from adapters.bedrock_kb import BedrockKnowledgeBase
@@ -613,17 +614,26 @@ def update_rating_pg(session_uuid, msg_id, reaction=None, user_comment=None):
 
 
 @app.post("/session-transcript")
-async def session_transcript_post(request: Request):
+async def session_transcript_post(
+    request: Request,
+    bot_id: Annotated[str | None, Form()] = None,
+):
     session_uuid = request.cookies.get(COOKIE_NAME) or request.state.client_cookie_disabled_uuid
+    scoped_session_uuid = session_uuid
+    if bot_id:
+        bot_config = get_relational_bot(bot_id)
+        if bot_config:
+            scoped_session_uuid = _scoped_relational_session_id(session_uuid, bot_config.bot_id)
 
     print("=" * 60)
     print(f"📥 TRANSCRIPT REQUEST")
     print(f"Cookie value: {request.cookies.get(COOKIE_NAME)}")
     print(f"State value: {request.state.client_cookie_disabled_uuid}")
     print(f"Final session_uuid: {session_uuid}")
+    print(f"Scoped session_uuid: {scoped_session_uuid}")
     print(f"All sessions: {list(memory.sessions.keys())}")
 
-    session_history = await memory.get_session_history_all(session_uuid)
+    session_history = await memory.get_session_history_all(scoped_session_uuid)
     print(f"This session has {len(session_history)} messages")
 
     if session_history:
@@ -634,7 +644,7 @@ async def session_transcript_post(request: Request):
     if not session_history or not isinstance(session_history, list):
         return {"message": "No chat history found for this session."}
 
-    filename = f"{session_uuid}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+    filename = f"{scoped_session_uuid}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
     session_text = ""
     for entry in session_history:
         if isinstance(entry, dict) and "role" in entry and "content" in entry:
@@ -653,11 +663,17 @@ async def submit_rating_api_post(
         request: Request,
         message_id: str = Form(..., description="The ID of the message"),
         reaction: str = Form(None, description="Optional reaction to the message"),
-        userComment: str = Form(None, description="Optional user comment")
+        userComment: str = Form(None, description="Optional user comment"),
+        bot_id: str = Form(None, description="Optional relational bot ID")
     ):
     try:
         session_uuid = request.cookies.get(COOKIE_NAME) or request.state.client_cookie_disabled_uuid
-        counter_uuid = await memory.get_message_count_uuid(session_uuid)
+        scoped_session_uuid = session_uuid
+        if bot_id:
+            bot_config = get_relational_bot(bot_id)
+            if bot_config:
+                scoped_session_uuid = _scoped_relational_session_id(session_uuid, bot_config.bot_id)
+        counter_uuid = await memory.get_message_count_uuid(scoped_session_uuid)
         msg_id = counter_uuid + "." + message_id
         update_rating_pg(session_uuid, msg_id, reaction=reaction, user_comment=userComment)
         return {"status": "success"}
@@ -738,57 +754,256 @@ async def translate_post(request: Request):
 NO_SOURCES_MESSAGE = {"en": "Sources are not available for this reply.", "es": "Las fuentes no están disponibles para esta respuesta."}
 
 
-@app.post('/riverbot_chat_sources_api')
-async def riverbot_chat_sources_post(request: Request, background_tasks:BackgroundTasks):
+def _scoped_relational_session_id(base_session_uuid: str, bot_id: str) -> str:
+    """Isolate in-memory relational bot conversations per bot while sharing one browser cookie."""
+    return f"{base_session_uuid}::relbot::{(bot_id or '').lower()}"
+
+
+def _resolve_relational_bot_or_404(bot_id: str) -> BotConfig:
+    bot_config = get_relational_bot(bot_id)
+    if not bot_config:
+        raise HTTPException(status_code=404, detail=f"Unknown relational bot: {bot_id}")
+    return bot_config
+
+
+async def _relational_chat_sources_post(request: Request, background_tasks: BackgroundTasks, bot_config: BotConfig):
     session_uuid = request.cookies.get(COOKIE_NAME) or request.state.client_cookie_disabled_uuid
-    docs=await memory.get_latest_memory( session_id=session_uuid, read="documents")
-    user_query=await memory.get_latest_memory( session_id=session_uuid, read="content")
-    sources=await memory.get_latest_memory( session_id=session_uuid, read="sources")
-    user_question = await memory.get_latest_memory(session_id=session_uuid, read="content", travel=-2)
-    bot_response = await memory.get_latest_memory(session_id=session_uuid, read="content", travel=-1)
+    scoped_session_uuid = _scoped_relational_session_id(session_uuid, bot_config.bot_id)
+    docs = await memory.get_latest_memory(session_id=scoped_session_uuid, read="documents")
+    user_query = await memory.get_latest_memory(session_id=scoped_session_uuid, read="content")
+    sources = await memory.get_latest_memory(session_id=scoped_session_uuid, read="sources")
+    user_question = await memory.get_latest_memory(session_id=scoped_session_uuid, read="content", travel=-2)
+    bot_response = await memory.get_latest_memory(session_id=scoped_session_uuid, read="content", travel=-1)
     show_sources = await should_show_sources(user_question or "", bot_response or "", sources or [])
     if not show_sources:
         lang = "es" if detect_language(user_query or user_question or "") == "es" else "en"
-        await memory.increment_message_count(session_uuid)
-        return {"resp": NO_SOURCES_MESSAGE[lang], "msgID": await memory.get_message_count(session_uuid)}
-    language = detect_language(user_query)
+        await memory.increment_message_count(scoped_session_uuid)
+        return {"resp": NO_SOURCES_MESSAGE[lang], "msgID": await memory.get_message_count(scoped_session_uuid)}
 
-    memory_payload={
-        "documents":docs,
-        "sources":sources
-    }
-    
-    formatted_source_list=await memory.format_sources_as_html(source_list=sources)
-    instruction_text = "Proporcióname las fuentes." if language == 'es' else "Provide me sources."
+    language = detect_language(user_query)
+    memory_payload = {"documents": docs, "sources": sources}
+    formatted_source_list = await memory.format_sources_as_html(source_list=sources)
+    instruction_text = "Proporcióname las fuentes." if language == "es" else "Provide me sources."
     generated_user_query = f'{custom_tags.tags["SOURCE_REQUEST"][0]}{instruction_text}{custom_tags.tags["SOURCE_REQUEST"][1]}'
     generated_user_query += f'{custom_tags.tags["OG_QUERY"][0]}{user_query}{custom_tags.tags["OG_QUERY"][1]}'
-    bot_response=formatted_source_list
+    bot_response = formatted_source_list
 
-    await memory.add_message_to_session( 
-        session_id=session_uuid, 
-        message={"role":"user","content":generated_user_query},
-        source_list=memory_payload
+    await memory.add_message_to_session(
+        session_id=scoped_session_uuid,
+        message={"role": "user", "content": generated_user_query},
+        source_list=memory_payload,
     )
-    await memory.add_message_to_session( 
-        session_id=session_uuid, 
-        message={"role":"assistant","content":bot_response},
-        source_list=memory_payload
+    await memory.add_message_to_session(
+        session_id=scoped_session_uuid,
+        message={"role": "assistant", "content": bot_response},
+        source_list=memory_payload,
     )
-    await memory.increment_message_count(session_uuid)
+    await memory.increment_message_count(scoped_session_uuid)
 
-    background_tasks.add_task(log_message,
+    background_tasks.add_task(
+        log_message,
         session_uuid=session_uuid,
-        msg_id=await memory.get_message_count_uuid_combo(session_uuid), 
-        user_query=generated_user_query, 
+        msg_id=await memory.get_message_count_uuid_combo(scoped_session_uuid),
+        user_query=generated_user_query,
         response_content=bot_response,
         source=[],
-        chatbot_type="riverbot"
+        chatbot_type=bot_config.chatbot_type,
     )
 
     return {
-        "resp":bot_response,
-        "msgID": await memory.get_message_count(session_uuid)
+        "resp": bot_response,
+        "msgID": await memory.get_message_count(scoped_session_uuid),
     }
+
+
+async def _relational_chat_action_items_post(request: Request, background_tasks: BackgroundTasks, bot_config: BotConfig):
+    session_uuid = request.cookies.get(COOKIE_NAME) or request.state.client_cookie_disabled_uuid
+    scoped_session_uuid = _scoped_relational_session_id(session_uuid, bot_config.bot_id)
+    docs = await memory.get_latest_memory(session_id=scoped_session_uuid, read="documents")
+    sources = await memory.get_latest_memory(session_id=scoped_session_uuid, read="sources")
+    memory_payload = {"documents": docs, "sources": sources}
+
+    user_query = await memory.get_latest_memory(session_id=scoped_session_uuid, read="content", travel=-2)
+    bot_response = await memory.get_latest_memory(session_id=scoped_session_uuid, read="content")
+
+    if not knowledge_base:
+        raise HTTPException(503, "RAG is not available. Configure PostgreSQL with pgvector.")
+    doc_content_str = await knowledge_base.knowledge_to_string({"documents": docs})
+    llm_body = await llm_adapter.get_llm_nextsteps_body(
+        kb_data=doc_content_str,
+        user_query=user_query,
+        bot_response=bot_response,
+    )
+    response_content = await llm_adapter.generate_response(llm_body=llm_body)
+
+    generated_user_query = f'{custom_tags.tags["NEXTSTEPS_REQUEST"][0]}Provide me the action items{custom_tags.tags["NEXTSTEPS_REQUEST"][1]}'
+    generated_user_query += f'{custom_tags.tags["OG_QUERY"][0]}{user_query}{custom_tags.tags["OG_QUERY"][1]}'
+
+    await memory.add_message_to_session(
+        session_id=scoped_session_uuid,
+        message={"role": "user", "content": generated_user_query},
+        source_list=[],
+    )
+    await memory.add_message_to_session(
+        session_id=scoped_session_uuid,
+        message={"role": "assistant", "content": response_content},
+        source_list=memory_payload,
+    )
+    await memory.increment_message_count(scoped_session_uuid)
+
+    background_tasks.add_task(
+        log_message,
+        session_uuid=session_uuid,
+        msg_id=await memory.get_message_count_uuid_combo(scoped_session_uuid),
+        user_query=generated_user_query,
+        response_content=response_content,
+        source=sources,
+        chatbot_type=bot_config.chatbot_type,
+    )
+
+    return {
+        "resp": response_content,
+        "msgID": await memory.get_message_count(scoped_session_uuid),
+    }
+
+
+async def _relational_chat_detailed_post(request: Request, background_tasks: BackgroundTasks, bot_config: BotConfig):
+    session_uuid = request.cookies.get(COOKIE_NAME) or request.state.client_cookie_disabled_uuid
+    scoped_session_uuid = _scoped_relational_session_id(session_uuid, bot_config.bot_id)
+    docs = await memory.get_latest_memory(session_id=scoped_session_uuid, read="documents")
+    sources = await memory.get_latest_memory(session_id=scoped_session_uuid, read="sources")
+    memory_payload = {"documents": docs, "sources": sources}
+
+    user_query = await memory.get_latest_memory(session_id=scoped_session_uuid, read="content", travel=-2)
+    bot_response = await memory.get_latest_memory(session_id=scoped_session_uuid, read="content")
+
+    if not knowledge_base:
+        raise HTTPException(503, "RAG is not available. Configure PostgreSQL with pgvector.")
+    doc_content_str = await knowledge_base.knowledge_to_string({"documents": docs})
+    llm_body = await llm_adapter.get_llm_detailed_body(
+        kb_data=doc_content_str,
+        user_query=user_query,
+        bot_response=bot_response,
+    )
+    response_content = await llm_adapter.generate_response(llm_body=llm_body)
+
+    generated_user_query = f'{custom_tags.tags["MOREDETAIL_REQUEST"][0]}Provide me a more detailed response.{custom_tags.tags["MOREDETAIL_REQUEST"][1]}'
+    generated_user_query += f'{custom_tags.tags["OG_QUERY"][0]}{user_query}{custom_tags.tags["OG_QUERY"][1]}'
+
+    await memory.add_message_to_session(
+        session_id=scoped_session_uuid,
+        message={"role": "user", "content": generated_user_query},
+        source_list=[],
+    )
+    await memory.add_message_to_session(
+        session_id=scoped_session_uuid,
+        message={"role": "assistant", "content": response_content},
+        source_list=memory_payload,
+    )
+    await memory.increment_message_count(scoped_session_uuid)
+
+    background_tasks.add_task(
+        log_message,
+        session_uuid=session_uuid,
+        msg_id=await memory.get_message_count_uuid_combo(scoped_session_uuid),
+        user_query=generated_user_query,
+        response_content=response_content,
+        source=sources,
+        chatbot_type=bot_config.chatbot_type,
+    )
+
+    return {
+        "resp": response_content,
+        "msgID": await memory.get_message_count(scoped_session_uuid),
+    }
+
+
+async def _relational_chat_api_post(
+    request: Request,
+    user_query: str,
+    background_tasks: BackgroundTasks,
+    bot_config: BotConfig,
+):
+    session_uuid = request.cookies.get(COOKIE_NAME) or request.state.client_cookie_disabled_uuid
+    scoped_session_uuid = _scoped_relational_session_id(session_uuid, bot_config.bot_id)
+    await memory.create_session(scoped_session_uuid)
+
+    moderation_result, intent_result = await llm_adapter.safety_checks(user_query)
+    prompt_injection = 1
+    unrelated_topic = 1
+    not_handled = "I am sorry, your request cannot be handled."
+    data = {}
+    try:
+        data = json.loads(intent_result)
+        prompt_injection = data["prompt_injection"]
+        unrelated_topic = data["unrelated_topic"]
+    except Exception as e:
+        print(intent_result)
+        print("ERROR", str(e))
+
+    if moderation_result or (prompt_injection or unrelated_topic):
+        response_content = "I am sorry, your request is inappropriate and I cannot answer it." if moderation_result else not_handled
+        await memory.increment_message_count(scoped_session_uuid)
+        generated_user_query = f'{custom_tags.tags["SECURITY_CHECK"][0]}{data}{custom_tags.tags["SECURITY_CHECK"][1]}'
+        generated_user_query += f'{custom_tags.tags["OG_QUERY"][0]}{user_query}{custom_tags.tags["OG_QUERY"][1]}'
+        background_tasks.add_task(
+            log_message,
+            session_uuid=session_uuid,
+            msg_id=await memory.get_message_count_uuid_combo(scoped_session_uuid),
+            user_query=generated_user_query,
+            response_content=response_content,
+            source=[],
+            chatbot_type=bot_config.chatbot_type,
+        )
+        return {"resp": response_content, "msgID": await memory.get_message_count(scoped_session_uuid)}
+
+    await memory.add_message_to_session(
+        session_id=scoped_session_uuid,
+        message={"role": "user", "content": user_query},
+        source_list=[],
+    )
+
+    language = detect_language(user_query)
+    if not knowledge_base:
+        raise HTTPException(503, "RAG is not available. Configure PostgreSQL (DATABASE_URL or DB_*) with pgvector.")
+    docs = await knowledge_base.ann_search(user_query, locale=language)
+    doc_content_str = await knowledge_base.knowledge_to_string(docs)
+
+    llm_body = await llm_adapter.get_llm_body(
+        chat_history=await memory.get_session_history_all(scoped_session_uuid),
+        kb_data=doc_content_str,
+        temperature=.5,
+        max_tokens=500,
+        endpoint_type="riverbot",
+        system_prompt_override=bot_config.persona_prompt,
+    )
+    response_content = await llm_adapter.generate_response(llm_body=llm_body)
+
+    await memory.add_message_to_session(
+        session_id=scoped_session_uuid,
+        message={"role": "assistant", "content": response_content},
+        source_list=docs,
+    )
+
+    await memory.increment_message_count(scoped_session_uuid)
+    background_tasks.add_task(
+        log_message,
+        session_uuid=session_uuid,
+        msg_id=await memory.get_message_count_uuid_combo(scoped_session_uuid),
+        user_query=user_query,
+        response_content=response_content,
+        source=docs["sources"],
+        chatbot_type=bot_config.chatbot_type,
+    )
+
+    return {
+        "resp": response_content.replace('\n\n', '</p><p>').replace('\n', '<br>'),
+        "msgID": await memory.get_message_count(scoped_session_uuid),
+    }
+
+@app.post('/riverbot_chat_sources_api')
+async def riverbot_chat_sources_post(request: Request, background_tasks:BackgroundTasks):
+    return await _relational_chat_sources_post(request, background_tasks, _resolve_relational_bot_or_404("riverbot"))
 
 @app.post('/chat_sources_api')
 async def chat_sources_post(
@@ -879,55 +1094,7 @@ async def chat_sources_post(
 
 @app.post('/riverbot_chat_actionItems_api')
 async def riverbot_chat_action_items_api_post(request: Request, background_tasks:BackgroundTasks):
-    session_uuid = request.cookies.get(COOKIE_NAME) or request.state.client_cookie_disabled_uuid
-    docs=await memory.get_latest_memory( session_id=session_uuid, read="documents")
-    sources=await memory.get_latest_memory( session_id=session_uuid, read="sources")
-
-    memory_payload={
-        "documents":docs,
-        "sources":sources
-    }
-
-    user_query=await memory.get_latest_memory( session_id=session_uuid, read="content",travel=-2)
-    bot_response=await memory.get_latest_memory( session_id=session_uuid, read="content")
-    
-    language = detect_language(user_query)
-
-    if not knowledge_base:
-        raise HTTPException(503, "RAG is not available. Configure PostgreSQL with pgvector.")
-    doc_content_str = await knowledge_base.knowledge_to_string({"documents": docs})
-
-    llm_body=await llm_adapter.get_llm_nextsteps_body( kb_data=doc_content_str,user_query=user_query,bot_response=bot_response )
-    response_content = await llm_adapter.generate_response(llm_body=llm_body)
-
-    generated_user_query = f'{custom_tags.tags["NEXTSTEPS_REQUEST"][0]}Provide me the action items{custom_tags.tags["NEXTSTEPS_REQUEST"][1]}'
-    generated_user_query += f'{custom_tags.tags["OG_QUERY"][0]}{user_query}{custom_tags.tags["OG_QUERY"][1]}'
-
-    await memory.add_message_to_session( 
-        session_id=session_uuid, 
-        message={"role":"user","content":generated_user_query},
-        source_list=[]
-    )
-    await memory.add_message_to_session( 
-        session_id=session_uuid, 
-        message={"role":"assistant","content":response_content},
-        source_list=memory_payload
-    )
-    await memory.increment_message_count(session_uuid)
-
-    background_tasks.add_task(log_message,
-        session_uuid=session_uuid,
-        msg_id=await memory.get_message_count_uuid_combo(session_uuid),
-        user_query=generated_user_query,
-        response_content=response_content,
-        source=sources,
-        chatbot_type="riverbot"
-    )
-
-    return {
-        "resp":response_content,
-        "msgID": await memory.get_message_count(session_uuid)
-    }
+    return await _relational_chat_action_items_post(request, background_tasks, _resolve_relational_bot_or_404("riverbot"))
 
 @app.post('/chat_actionItems_api')
 async def chat_action_items_api_post(
@@ -995,55 +1162,7 @@ async def chat_action_items_api_post(
 
 @app.post('/riverbot_chat_detailed_api')
 async def riverbot_chat_detailed_api_post(request: Request, background_tasks:BackgroundTasks):
-    session_uuid = request.cookies.get(COOKIE_NAME) or request.state.client_cookie_disabled_uuid
-    docs=await memory.get_latest_memory( session_id=session_uuid, read="documents")
-    sources=await memory.get_latest_memory( session_id=session_uuid, read="sources")
-
-    memory_payload={
-        "documents":docs,
-        "sources":sources
-    }
-
-    user_query=await memory.get_latest_memory( session_id=session_uuid, read="content",travel=-2)
-    bot_response=await memory.get_latest_memory( session_id=session_uuid, read="content")
-    
-    language = detect_language(user_query)
-
-    if not knowledge_base:
-        raise HTTPException(503, "RAG is not available. Configure PostgreSQL with pgvector.")
-    doc_content_str = await knowledge_base.knowledge_to_string({"documents": docs})
-
-    llm_body=await llm_adapter.get_llm_detailed_body( kb_data=doc_content_str,user_query=user_query,bot_response=bot_response )
-    response_content = await llm_adapter.generate_response(llm_body=llm_body)
-
-    generated_user_query = f'{custom_tags.tags["MOREDETAIL_REQUEST"][0]}Provide me a more detailed response.{custom_tags.tags["MOREDETAIL_REQUEST"][1]}'
-    generated_user_query += f'{custom_tags.tags["OG_QUERY"][0]}{user_query}{custom_tags.tags["OG_QUERY"][1]}'
-
-    await memory.add_message_to_session( 
-        session_id=session_uuid, 
-        message={"role":"user","content":generated_user_query},
-        source_list=[]
-    )
-    await memory.add_message_to_session( 
-        session_id=session_uuid, 
-        message={"role":"assistant","content":response_content},
-        source_list=memory_payload
-    )
-    await memory.increment_message_count(session_uuid)
-
-    background_tasks.add_task(log_message,
-        session_uuid=session_uuid,
-        msg_id=await memory.get_message_count_uuid_combo(session_uuid), 
-        user_query=generated_user_query, 
-        response_content=response_content,
-        source=sources,
-        chatbot_type="riverbot"
-    )
-
-    return {
-        "resp":response_content,
-        "msgID": await memory.get_message_count(session_uuid)
-    }
+    return await _relational_chat_detailed_post(request, background_tasks, _resolve_relational_bot_or_404("riverbot"))
 
 @app.post('/chat_detailed_api')
 async def chat_detailed_api_post(
@@ -1221,101 +1340,32 @@ async def chat_api_post(
 
 @app.post('/riverbot_chat_api')
 async def riverbot_chat_api_post(request: Request, user_query: Annotated[str, Form()], background_tasks:BackgroundTasks ):
-    user_query=user_query
-    session_uuid = request.cookies.get(COOKIE_NAME) or request.state.client_cookie_disabled_uuid
+    return await _relational_chat_api_post(request, user_query, background_tasks, _resolve_relational_bot_or_404("riverbot"))
 
-    await memory.create_session(session_uuid)
-        
-    moderation_result,intent_result = await llm_adapter.safety_checks(user_query)
 
-    user_intent=1
-    prompt_injection=1
-    unrelated_topic=1
-    not_handled="I am sorry, your request cannot be handled."
-    data = {}
-    try:
-        data = json.loads(intent_result)
-        user_intent=data["user_intent"]
-        prompt_injection=data["prompt_injection"]
-        unrelated_topic=data["unrelated_topic"]
-    except Exception as e:
-        print(intent_result)
-        print("ERROR", str(e))
+@app.post('/bots/{bot_id}/chat')
+async def relational_bot_chat_api_post(
+    bot_id: str,
+    request: Request,
+    user_query: Annotated[str, Form()],
+    background_tasks: BackgroundTasks,
+):
+    return await _relational_chat_api_post(request, user_query, background_tasks, _resolve_relational_bot_or_404(bot_id))
 
-    if( moderation_result or (prompt_injection or unrelated_topic)):
-        response_content= "I am sorry, your request is inappropriate and I cannot answer it." if moderation_result else not_handled
 
-        await memory.increment_message_count(session_uuid)
+@app.post('/bots/{bot_id}/chat_detailed')
+async def relational_bot_chat_detailed_api_post(bot_id: str, request: Request, background_tasks: BackgroundTasks):
+    return await _relational_chat_detailed_post(request, background_tasks, _resolve_relational_bot_or_404(bot_id))
 
-        generated_user_query = f'{custom_tags.tags["SECURITY_CHECK"][0]}{data}{custom_tags.tags["SECURITY_CHECK"][1]}'
-        generated_user_query += f'{custom_tags.tags["OG_QUERY"][0]}{user_query}{custom_tags.tags["OG_QUERY"][1]}'
 
-        background_tasks.add_task(log_message,
-            session_uuid=session_uuid,
-            msg_id=await memory.get_message_count_uuid_combo(session_uuid),
-            user_query=generated_user_query,
-            response_content=response_content,
-            source=[],
-            chatbot_type="riverbot" 
-        )
+@app.post('/bots/{bot_id}/chat_actionItems')
+async def relational_bot_chat_action_items_api_post(bot_id: str, request: Request, background_tasks: BackgroundTasks):
+    return await _relational_chat_action_items_post(request, background_tasks, _resolve_relational_bot_or_404(bot_id))
 
-        return {
-            "resp":response_content,
-            "msgID": await memory.get_message_count(session_uuid)
-        }
 
-    await memory.add_message_to_session( 
-        session_id=session_uuid, 
-        message={"role":"user","content":user_query},
-        source_list=[]
-    )
-    
-    language = detect_language(user_query)
-
-    if not knowledge_base:
-        raise HTTPException(503, "RAG is not available. Configure PostgreSQL (DATABASE_URL or DB_*) with pgvector.")
-    docs = await knowledge_base.ann_search(user_query, locale=language)
-    doc_content_str = await knowledge_base.knowledge_to_string(docs)
-    logging.info(f"🔍 RAG Search ({language}): Found {len(docs.get('documents', []))} documents, {len(docs.get('sources', []))} sources")
-    
-    if docs.get('sources'):
-        logging.info(f"📚 Sources: {[s.get('filename', 'unknown') for s in docs['sources']]}")
-    else:
-        logging.warning("⚠️  No sources found in RAG search - vector store may be empty")
-    
-    logging.info(f"📄 Knowledge base content length: {len(doc_content_str)} characters")
-    
-    logging.info("Using riverbot system prompt")
-    
-    llm_body = await llm_adapter.get_llm_body( 
-        chat_history=await memory.get_session_history_all(session_uuid), 
-        kb_data=doc_content_str,
-        temperature=.5,
-        max_tokens=500,
-        endpoint_type="riverbot" )
-
-    response_content = await llm_adapter.generate_response(llm_body=llm_body)
-
-    await memory.add_message_to_session( 
-        session_id=session_uuid, 
-        message={"role":"assistant","content":response_content},
-        source_list=docs
-    )
-
-    await memory.increment_message_count(session_uuid)
-    background_tasks.add_task(log_message,
-        session_uuid=session_uuid,
-        msg_id=await memory.get_message_count_uuid_combo(session_uuid), 
-        user_query=user_query, 
-        response_content=response_content,
-        source=docs["sources"],
-        chatbot_type="riverbot"
-    )
-
-    return {
-        "resp": response_content.replace('\n\n', '</p><p>').replace('\n', '<br>'),
-        "msgID": await memory.get_message_count(session_uuid)
-    }
+@app.post('/bots/{bot_id}/chat_sources')
+async def relational_bot_chat_sources_api_post(bot_id: str, request: Request, background_tasks: BackgroundTasks):
+    return await _relational_chat_sources_post(request, background_tasks, _resolve_relational_bot_or_404(bot_id))
 
 # Serve React frontend static files (favicons)
 @app.get("/favicon.ico")
@@ -1360,7 +1410,40 @@ async def spanish_translation(request: Request):
 @app.get("/riverbot", response_class=HTMLResponse)
 async def riverbot_page(request: Request):
     """Serve the riverbot page (Jinja template)"""
-    return templates.TemplateResponse("riverbot.html", {"request": request})
+    return templates.TemplateResponse(
+        "riverbot.html",
+        {
+            "request": request,
+            "bot_id": "riverbot",
+            "bot_name": "River",
+        },
+    )
+
+
+@app.get("/oceanbot", response_class=HTMLResponse)
+async def oceanbot_page(request: Request):
+    """Serve the oceanbot page (Jinja template)"""
+    return templates.TemplateResponse(
+        "riverbot.html",
+        {
+            "request": request,
+            "bot_id": "oceanbot",
+            "bot_name": "Ocean",
+        },
+    )
+
+
+@app.get("/mountainbot", response_class=HTMLResponse)
+async def mountainbot_page(request: Request):
+    """Serve the mountainbot page (Jinja template)"""
+    return templates.TemplateResponse(
+        "riverbot.html",
+        {
+            "request": request,
+            "bot_id": "mountainbot",
+            "bot_name": "Mountain",
+        },
+    )
 
 # React SPA at /museum
 @app.get("/museum", response_class=HTMLResponse)
