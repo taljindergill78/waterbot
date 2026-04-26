@@ -1445,6 +1445,45 @@ async def mountainbot_page(request: Request):
         },
     )
 
+
+@app.get("/landbot", response_class=HTMLResponse)
+async def landbot_page(request: Request):
+    """Serve the landbot page (Jinja template)"""
+    return templates.TemplateResponse(
+        "riverbot.html",
+        {
+            "request": request,
+            "bot_id": "landbot",
+            "bot_name": "Land",
+        },
+    )
+
+
+@app.get("/treebot", response_class=HTMLResponse)
+async def treebot_page(request: Request):
+    """Serve the treebot page (Jinja template)"""
+    return templates.TemplateResponse(
+        "riverbot.html",
+        {
+            "request": request,
+            "bot_id": "treebot",
+            "bot_name": "Tree",
+        },
+    )
+
+
+@app.get("/wastebot", response_class=HTMLResponse)
+async def wastebot_page(request: Request):
+    """Serve the wastebot page (Jinja template)"""
+    return templates.TemplateResponse(
+        "riverbot.html",
+        {
+            "request": request,
+            "bot_id": "wastebot",
+            "bot_name": "Waste",
+        },
+    )
+
 # React SPA at /museum
 @app.get("/museum", response_class=HTMLResponse)
 @app.get("/museum/", response_class=HTMLResponse)

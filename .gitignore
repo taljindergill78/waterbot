@@ -5,6 +5,9 @@ ecr_auth.sh
 *.md
 !docs/*.md
 
+# Internal working notes
+document/
+
 # Mac OS files
 .DS_Store
 

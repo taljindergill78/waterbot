@@ -35,6 +35,27 @@ RELATIONAL_BOTS: dict[str, BotConfig] = {
         chatbot_type="mountainbot",
         legacy_page="mountainbot.html",
     ),
+    "landbot": BotConfig(
+        bot_id="landbot",
+        display_name="LandBot",
+        persona_prompt="You are Land. Answer as a land would.",
+        chatbot_type="landbot",
+        legacy_page="landbot.html",
+    ),
+    "treebot": BotConfig(
+        bot_id="treebot",
+        display_name="TreeBot",
+        persona_prompt="You are Tree. Answer as a tree would.",
+        chatbot_type="treebot",
+        legacy_page="treebot.html",
+    ),
+    "wastebot": BotConfig(
+        bot_id="wastebot",
+        display_name="WasteBot",
+        persona_prompt="You are Waste. Answer as a waste would.",
+        chatbot_type="wastebot",
+        legacy_page="wastebot.html",
+    ),
 }
 
 
